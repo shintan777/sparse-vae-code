@@ -10,7 +10,7 @@ from nltk.stem import WordNetLemmatizer
 from nltk.corpus import stopwords
 from sklearn.feature_extraction.text import CountVectorizer
 from scipy.stats import multivariate_normal
-import tensorflow as tf
+# import tensorflow as tf
 import numpy.random as npr
 
 class LemmaTokenizer:
