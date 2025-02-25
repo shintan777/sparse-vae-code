@@ -108,7 +108,7 @@ class ModelTrainer():
                 l_w = w_loss.item()
 
 
-            if epoch % 2 == 0:
+            if epoch % 10 == 0:
                 print("Epoch:", epoch, "Total loss:", f"{l_total:.3}", "Likelihood:", f"{l_like:.3}",
                   "KL loss:", f"{l_kl:.3}", "Sigma loss:", f"{l_reg:.3}", "W loss:", f"{l_w:.3}")
                 sys.stdout.flush()

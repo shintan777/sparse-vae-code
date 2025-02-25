@@ -1,0 +1,10 @@
+bottleneck
+conda
+nltk
+numpy
+pandas
+scikit-learn
+scipy
+torch
+tensorflow
+FrEIE

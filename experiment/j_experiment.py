@@ -36,6 +36,7 @@ class NonlinearICA(nn.Module):
             nn.Linear(hidden_dim, latent_dim)
         )
         self.flow = self.build_glow(latent_dim)
+        self.input_dim = input_dim
     
     def build_glow(self, latent_dim):
         def subnet_fc(c_in, c_out):
@@ -49,6 +50,11 @@ class NonlinearICA(nn.Module):
     def forward(self, x):
         sources = self.encoder(x)  # Extract independent latent sources
         mixed_x, _ = self.flow(sources)  # Apply GLOW-based nonlinear mixing transformation
+        
+        if mixed_x.shape[1] != self.input_dim:
+            mixed_x = nn.Linear(mixed_x.shape[1], self.input_dim).to(mixed_x.device)(mixed_x)
+
+        
         z_mean = sources
         z_log_var = torch.zeros_like(sources)
         return mixed_x, sources, z_mean, z_log_var
@@ -112,7 +118,16 @@ def train_model(args, model, dataloader):
 if __name__ == "__main__":
     args = parse_args()
     dataset = BaseDataset(args.data, data_file=args.datafile, processed_data_file=args.procfile, is_discrete_data=args.is_discrete)
-    dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True)
+    
+    # Ensure dataset has training data
+    dataset.assign_splits(num_splits=args.num_folds)
+    dataset.split_data(fold=args.split)
+    
+    dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True) if hasattr(dataset, 'tr_data') else None
+    
+    if dataloader is None:
+        raise ValueError("Dataset does not contain training data. Ensure proper dataset splitting.")
+    
     model = NonlinearICA(dataset.get_num_features(), latent_dim=5)
     trained_model = train_model(args, model, dataloader)
     evaluator = Evaluator(model, dataset, is_discrete=args.is_discrete)
