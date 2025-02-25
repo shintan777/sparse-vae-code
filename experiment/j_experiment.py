@@ -129,7 +129,7 @@ if __name__ == "__main__":
         raise ValueError("Dataset does not contain training data. Ensure proper dataset splitting.")
     
     model = NonlinearICA(dataset.get_num_features(), latent_dim=5)
-    trained_model = train_model(args, model, dataloader)
+    model = train_model(args, model, dataloader)
     evaluator = Evaluator(model, dataset, is_discrete=args.is_discrete)
     heldout_nll = evaluator.evaluate_heldout_nll()
     print(f"Heldout Negative Log-Likelihood: {heldout_nll}")
