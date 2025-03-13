@@ -15,9 +15,9 @@ import FrEIA.modules as Fm
 def parse_args():
     parser = argparse.ArgumentParser(description="Nonlinear ICA with Structural Sparsity")
     parser.add_argument("--lambda_sparsity", type=float, default=0.1, help="Regularization strength for MCP penalty")
-    parser.add_argument("--lr", type=float, default=0.01, help="Learning rate")
+    parser.add_argument("--lr", type=float, default=0.001, help="Learning rate")
     parser.add_argument("--num_epochs", type=int, default=100, help="Number of training epochs")
-    parser.add_argument("--batch_size", type=int, default=200, help="Batch size for training")
+    parser.add_argument("--batch_size", type=int, default=100, help="Batch size for training")
     parser.add_argument("--data", type=str, default="simulated", help="Dataset name")
     parser.add_argument("--datafile", type=str, default="", help="Path to raw data file")
     parser.add_argument("--procfile", type=str, default="", help="Path to processed data file")
@@ -28,10 +28,12 @@ def parse_args():
     return parser.parse_args()
 
 class NonlinearICA(nn.Module):
-    def __init__(self, input_dim, latent_dim, hidden_dim=128):
+    def __init__(self, input_dim, latent_dim, hidden_dim=256):
         super().__init__()
         self.encoder = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, latent_dim)
         )
@@ -40,24 +42,34 @@ class NonlinearICA(nn.Module):
     
     def build_glow(self, latent_dim):
         def subnet_fc(c_in, c_out):
-            return nn.Sequential(nn.Linear(c_in, 128), nn.ReLU(), nn.Linear(128, c_out))
+            return nn.Sequential(nn.Linear(c_in, 128), nn.ReLU(), nn.Linear(128, c_out), nn.BatchNorm1d(c_out))
         nodes = [Ff.InputNode(latent_dim, name='input')]
         for i in range(10):
+            nodes.append(Ff.Node(nodes[-1], Fm.ActNorm, {}, name=f'actnorm_{i}'))  # Normalize activations
             nodes.append(Ff.Node(nodes[-1], Fm.GLOWCouplingBlock, {'subnet_constructor': subnet_fc}, name=f'coupling_{i}'))
         nodes.append(Ff.OutputNode(nodes[-1], name='output'))
         return Ff.ReversibleGraphNet(nodes, verbose=False)
     
+    
+    def whiten_zca(self, x):
+        """ Apply ZCA whitening to stabilize latent sources """
+        mean = x.mean(dim=0, keepdim=True)
+        cov = (x - mean).T @ (x - mean) / (x.shape[0] - 1)
+        U, S, V = torch.svd(cov)
+        W = U @ torch.diag(1.0 / (torch.sqrt(S) + 1e-5)) @ U.T
+        return (x - mean) @ W
+    
+
     def forward(self, x):
-        sources = self.encoder(x)  # Extract independent latent sources
-        mixed_x, _ = self.flow(sources)  # Apply GLOW-based nonlinear mixing transformation
+        sources = self.encoder(x)
+        sources = (sources - sources.mean(dim=0)) / (sources.std(dim=0) + 1e-6)  # Normalize sources
+        sources = self.whiten_zca(sources)
+        mixed_x, _ = self.flow(sources)
         
         if mixed_x.shape[1] != self.input_dim:
             mixed_x = nn.Linear(mixed_x.shape[1], self.input_dim).to(mixed_x.device)(mixed_x)
-
         
-        z_mean = sources
-        z_log_var = torch.zeros_like(sources)
-        return mixed_x, sources, z_mean, z_log_var
+        return mixed_x, sources, 0, 0
     
     def compute_jacobian(self, x):
         x.requires_grad_(True)
@@ -68,17 +80,17 @@ class NonlinearICA(nn.Module):
     def reconstruction_loss(self, x_pred, x):
         return nn.MSELoss()(x_pred, x)
     
-    def negative_log_likelihood(self, x, mixed_x, z_mean, z_log_var):
+    def negative_log_likelihood(self, x, mixed_x):
         recon_loss = self.reconstruction_loss(mixed_x, x)
-        kl_div = -0.5 * torch.sum(1 + z_log_var - z_mean.pow(2) - z_log_var.exp())
-        return recon_loss + kl_div
+        return recon_loss
     
     def get_generator_mask(self):
         return torch.eye(self.encoder[-1].out_features, device=self.encoder[-1].weight.device)
+    
 
 def apply_regularization(jacobian, lambda_sparsity=0.1, reg_type="mcp"):
     abs_jacobian = torch.abs(jacobian)
-    gamma = 1.0
+    gamma = 0.1
     if reg_type == "mcp":
         mask = abs_jacobian <= gamma * lambda_sparsity
         return torch.where(mask, lambda_sparsity * abs_jacobian - (jacobian**2) / (2 * gamma), (gamma * lambda_sparsity**2) / 2).sum()
@@ -92,28 +104,45 @@ def apply_regularization(jacobian, lambda_sparsity=0.1, reg_type="mcp"):
                                    torch.where(mask2, (a * lambda_sparsity * abs_jacobian - 0.5 * (abs_jacobian**2 + lambda_sparsity**2)) / (a - 1), 
                                                0.5 * (a + 1) * lambda_sparsity**2))
         return scad_penalty.sum()
+    
+def source_independence_loss(sources):
+    """ Compute covariance loss to enforce independence between sources """
+    batch_size, latent_dim = sources.shape
+    sources = sources - sources.mean(dim=0)  # Center the sources
+    cov_matrix = (sources.T @ sources) / (batch_size - 1)  # Covariance matrix
+    cov_matrix -= torch.eye(latent_dim, device=sources.device)  # Remove diagonal (self-correlation)
+    return torch.norm(cov_matrix, p="fro")  # Frobenius norm to penalize non-diagonal entries
+
 
 def train_model(args, model, dataloader):
-    optimizer = optim.Adam(model.parameters(), lr=args.lr)
+    optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-3)
     for epoch in range(args.num_epochs):
         for batch in dataloader:
             observed_data = batch['data'].to(torch.float)
             optimizer.zero_grad()
-            mixed_x, sources, z_mean, z_log_var = model(observed_data)
-            
-            nll_loss = model.negative_log_likelihood(observed_data, mixed_x, z_mean, z_log_var)
+            mixed_x, sources, _, _ = model(observed_data)
+
+            # Compute Losses
+            nll_loss = model.negative_log_likelihood(observed_data, mixed_x)
             jacobian = model.compute_jacobian(observed_data)
             sparsity_loss = apply_regularization(jacobian, lambda_sparsity=args.lambda_sparsity, reg_type=args.reg_type)
-            total_loss = nll_loss + sparsity_loss
-            
+            independence_loss = source_independence_loss(sources)  # New term for decorrelation
+
+            # Combine Losses
+            total_loss = nll_loss + sparsity_loss + 0.1 * independence_loss  # Weight for independence loss
+
             total_loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
         
         if (epoch + 1) % 10 == 0:
             print(f"Epoch [{epoch+1}/{args.num_epochs}], Loss: {total_loss.item():.4f}, "
-                  f"Negative Log-Likelihood: {nll_loss.item():.4f}, Sparsity Loss: {sparsity_loss.item():.4f}")
+                  f"Negative Log-Likelihood: {nll_loss.item():.4f}, "
+                  f"Sparsity Loss: {sparsity_loss.item():.4f}, "
+                  f"Independence Loss: {independence_loss.item():.4f}")
     
     return model
+
 
 if __name__ == "__main__":
     args = parse_args()
