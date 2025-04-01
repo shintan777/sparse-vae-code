@@ -10,6 +10,8 @@ from experiment.jacobian import VAE, train_vae  # Import from jacobian
 from experiment.j_experiment import NonlinearICA, train_model
 import argparse
 import os
+import matplotlib.pyplot as plt
+from scipy.spatial.distance import hamming
 
 # Argument Parser
 parser = argparse.ArgumentParser(description="Compare Nonlinear ICA, Sparse VAE, and Jacobian-Regularized VAE")
@@ -97,8 +99,97 @@ print(f"Sparse VAE Heldout NLL: {sparse_vae_nll}")
 print(f"Jacobian-Regularized VAE Heldout NLL: {vae_nll}")
 
 # Save results
-np.save(os.path.join(args.outdir, "ica_nll.npy"), np.array([ica_nll]))
-np.save(os.path.join(args.outdir, "sparse_vae_nll.npy"), np.array([sparse_vae_nll]))
-np.save(os.path.join(args.outdir, "vae_nll.npy"), np.array([vae_nll]))
+# np.save(os.path.join(args.outdir, "ica_nll.npy"), np.array([ica_nll]))
+# np.save(os.path.join(args.outdir, "sparse_vae_nll.npy"), np.array([sparse_vae_nll]))
+# np.save(os.path.join(args.outdir, "vae_nll.npy"), np.array([vae_nll]))
+
+
+def binarize(matrix, threshold=1e-3):
+    return (np.abs(matrix) > threshold).astype(int)
+
+def compute_decoder_jacobian_matrix(model, z_dim, input_dim):
+    model.eval()
+    z = torch.eye(z_dim, requires_grad=True)
+    z = z.to("cpu")
+
+    jacobian_rows = []
+    for i in range(input_dim):
+        x_i = model.decode(z)[:, i]  # shape: [z_dim]
+        grads = torch.autograd.grad(
+            outputs=x_i,
+            inputs=z,
+            grad_outputs=torch.ones_like(x_i),
+            create_graph=False,
+            retain_graph=True
+        )[0]  # shape: [z_dim, z_dim]
+        if grads is None:
+            print(f"Failed to compute gradients for x_{i}")
+            return None
+        jacobian_rows.append(grads.abs().sum(dim=1).cpu().detach().numpy())  # shape: [z_dim]
+
+    return np.stack(jacobian_rows, axis=0)  # final shape: [input_dim, latent_dim]
+
+
+# Replace W_vae with the jacobian-based structure
+W_vae = compute_decoder_jacobian_matrix(vae_model, args.latent_dim, input_dim)
+print("Jacobian min:", np.min(W_vae))
+print("Jacobian max:", np.max(W_vae))
+print(W_vae)
+
+W_sparse_vae = sparse_vae.get_generator_mask().detach().cpu().numpy()
+
+if W_vae is None:
+    raise RuntimeError("Jacobian computation failed. Check model.decode() or autograd.")
+
+
+
+# --- Optional: Load ground truth W if available ---
+W_true = getattr(dataset, "ground_truth_W", None)
+if isinstance(W_true, torch.Tensor):
+    W_true = W_true.detach().cpu().numpy()
+
+# --- Binarization helper ---
+
+
+# --- Binarize matrices ---
+W_sparse_vae_bin = binarize(W_sparse_vae)
+# W_vae_bin = binarize(W_vae)
+W_vae_bin = binarize(W_vae, threshold=2.5)
+W_true_bin = binarize(W_true) if W_true is not None else None
+
+# --- Visualization ---
+plt.figure(figsize=(12, 4))
+plt.subplot(1, 3, 1)
+plt.title("Sparse VAE W (binary)")
+plt.imshow(W_sparse_vae_bin, cmap="Greys", aspect="auto")
+
+plt.subplot(1, 3, 2)
+plt.title("Jacobian VAE W (binary)")
+plt.imshow(W_vae_bin, cmap="Greys", aspect="auto")
+
+if W_true_bin is not None:
+    plt.subplot(1, 3, 3)
+    plt.title("True W (binary)")
+    plt.imshow(W_true_bin, cmap="Greys", aspect="auto")
+
+plt.tight_layout()
+plt.savefig(os.path.join(args.outdir, "W_sparsity_comparison.png"))
+plt.show()
+
+# --- Hamming Distance ---
+def compute_hamming(W_est, W_true):
+    if W_true is None:
+        return None
+    return hamming(W_est.flatten(), W_true.flatten()) * W_true.size
+
+hamming_sparse = compute_hamming(W_sparse_vae_bin, W_true_bin)
+hamming_vae = compute_hamming(W_vae_bin, W_true_bin)
+
+if hamming_sparse is not None:
+    print(f"Hamming Distance (Sparse VAE vs True): {hamming_sparse:.2f}")
+    print(f"Hamming Distance (Jacobian VAE vs True): {hamming_vae:.2f}")
+else:
+    print("Ground truth W not available — skipping Hamming distance.")
+
 
 print("Experiment completed! Results saved.")
